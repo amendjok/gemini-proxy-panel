@@ -744,92 +744,118 @@ async function forceSetQuotaToLimit(keyId, category, modelId, counterKey) {
  * @param {string} keyId
  * @param {'Pro' | 'Flash' | 'Custom'} category
  * @param {string} [modelId] Optional model ID.
+ * @param {object | string} [errorDetails] Optional error object/string from Gemini, used to check for quotaId.
  * @returns {Promise<void>}
  */
-async function handle429Error(keyId, category, modelId) {
+async function handle429Error(keyId, category, modelId, errorDetails) {
     const CONSECUTIVE_429_LIMIT = 3;
 
-    // Start a transaction for atomic update
-    await configService.runDb('BEGIN TRANSACTION');
-    
+    // Determine if quota exceeded based on quotaId field
+    const quotaId = typeof errorDetails === 'object' && errorDetails !== null ? errorDetails.quotaId : null;
+    const isQuotaExceeded = typeof quotaId === 'string' && quotaId.toLowerCase().includes("perday");
+
+    // If it's a regular 429 (not quota exceeded), do nothing and return. Retry is handled by the caller.
+    if (!isQuotaExceeded) {
+        console.log(`Received regular 429 for key ${keyId}. Ignoring counter, retry will be handled by caller if applicable.`);
+        return;
+    }
+
+    // --- Handle Quota Exceeded 429 ---
+    console.warn(`Received quota-exceeded 429 for key ${keyId}. Proceeding with counter logic.`);
+
+    let transactionCommitted = false; // Flag to prevent double commit/rollback in finally block if forceSetQuotaToLimit is called
     try {
-        // Get models and quotas outside transaction as they don't need to be transactional
+        // Start transaction only if we are processing a quota-exceeded error
+        await configService.runDb('BEGIN TRANSACTION');
+
+        // Get models and quotas (can stay outside transaction)
         const [modelsConfig, categoryQuotas] = await Promise.all([
             configService.getModelsConfig(),
             configService.getCategoryQuotas()
         ]);
-        
+
         // Get key data within transaction
         const keyRow = await configService.getDb('SELECT consecutive_429_counts FROM gemini_keys WHERE id = ?', [keyId]);
 
         if (!keyRow) {
             await configService.runDb('ROLLBACK');
-            console.warn(`Cannot handle 429: Key info not found for ID: ${keyId}`);
+            console.warn(`Cannot handle quota 429: Key info not found for ID: ${keyId}`);
             return;
         }
 
         let consecutive429Counts = JSON.parse(keyRow.consecutive_429_counts || '{}');
 
-        // Determine the counter key and if a relevant quota exists
+        // Determine the counter key (no prefix needed anymore) and if a relevant quota exists
         let counterKey = undefined;
-        let needsQuotaCheck = false;
+        let needsQuotaCheck = false; // Still useful to check if a quota is actually configured
         const modelConfig = modelId ? modelsConfig[modelId] : undefined;
 
         if (category === 'Custom' && modelId) {
-            counterKey = modelId;
+            counterKey = modelId; // Use modelId directly
             needsQuotaCheck = !!modelConfig?.dailyQuota;
         } else if ((category === 'Pro' || category === 'Flash') && modelId && modelConfig?.individualQuota) {
-            counterKey = modelId;
-            needsQuotaCheck = true;
+            counterKey = modelId; // Use modelId directly
+            needsQuotaCheck = true; // Individual quota exists
         } else if (category === 'Pro') {
-            counterKey = 'category:pro';
+            counterKey = 'category:pro'; // Use category identifier
             needsQuotaCheck = !!categoryQuotas?.proQuota && isFinite(categoryQuotas.proQuota);
         } else if (category === 'Flash') {
-            counterKey = 'category:flash';
+            counterKey = 'category:flash'; // Use category identifier
             needsQuotaCheck = !!categoryQuotas?.flashQuota && isFinite(categoryQuotas.flashQuota);
         }
 
         if (!counterKey) {
             await configService.runDb('ROLLBACK');
-            console.warn(`Could not determine counter key for 429 handling (key ${keyId}, category ${category}, model ${modelId}).`);
-            return;
-        }
-        
-        if (!needsQuotaCheck) {
-            await configService.runDb('ROLLBACK');
-            console.log(`Skipping 429 counter for key ${keyId}, counter ${counterKey} as no relevant quota is configured.`);
+            console.warn(`Could not determine counter key for quota 429 handling (key ${keyId}, category ${category}, model ${modelId}).`);
             return;
         }
 
-        // Increment counter
+        // Only proceed if a relevant quota is actually configured for this limit type
+        if (!needsQuotaCheck) {
+            await configService.runDb('COMMIT'); // Commit as no changes needed, but avoids rollback error
+            console.log(`Skipping quota-exceeded 429 counter for key ${keyId}, counter ${counterKey} as no relevant quota is configured.`);
+            return;
+        }
+
+        // Increment counter for the specific quota key
         const currentCount = (consecutive429Counts[counterKey] || 0) + 1;
         consecutive429Counts[counterKey] = currentCount;
 
-        console.warn(`Received 429 for key ${keyId}, counter ${counterKey}. Consecutive count: ${currentCount}`);
+        console.warn(`Quota-exceeded 429 for key ${keyId}, counter ${counterKey}. Consecutive count: ${currentCount}`);
 
-        // Check if we need to force quota limit
+        // Check if the threshold is reached
         if (currentCount >= CONSECUTIVE_429_LIMIT) {
-            // Commit this transaction before calling forceSetQuotaToLimit
-            // because forceSetQuotaToLimit starts its own transaction
+            // Commit the current transaction *before* calling forceSetQuotaToLimit,
+            // as it starts its own transaction.
             await configService.runDb('COMMIT');
-            
-            console.warn(`Consecutive 429 limit (${CONSECUTIVE_429_LIMIT}) reached for key ${keyId}, counter ${counterKey}. Forcing quota limit.`);
-            // forceSetQuotaToLimit will handle the counterKey reset and has its own transaction
+            transactionCommitted = true; // Mark as committed
+
+            console.warn(`Consecutive quota-exceeded 429 limit (${CONSECUTIVE_429_LIMIT}) reached for key ${keyId}, counter ${counterKey}. Forcing quota limit.`);
+            // forceSetQuotaToLimit handles the counter reset and its own transaction.
             await forceSetQuotaToLimit(keyId, category, modelId, counterKey);
+
         } else {
-            // Limit not reached, update the count within this transaction
+            // Limit not reached, just update the count within this transaction
             await configService.runDb(
                 'UPDATE gemini_keys SET consecutive_429_counts = ? WHERE id = ?',
                 [JSON.stringify(consecutive429Counts), keyId]
             );
-            
             // Commit the transaction
             await configService.runDb('COMMIT');
+            transactionCommitted = true; // Mark as committed
         }
+
     } catch (e) {
-        // Rollback on error
-        await configService.runDb('ROLLBACK');
-        console.error(`Failed to handle 429 error for key ${keyId}:`, e);
+        console.error(`Failed to handle quota 429 error for key ${keyId}:`, e);
+        // Attempt to rollback if transaction wasn't already committed
+        if (!transactionCommitted) {
+            try {
+                await configService.runDb('ROLLBACK');
+            } catch (rollbackError) {
+                console.error(`Error during rollback after failed 429 handling for key ${keyId}:`, rollbackError);
+            }
+        }
+        // Do not rethrow, allow processing to continue if possible
     }
 }
 

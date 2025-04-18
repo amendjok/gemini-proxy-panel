@@ -16,13 +16,31 @@ router.use(requireWorkerAuth);
 router.get('/models', async (req, res, next) => {
     try {
         const modelsConfig = await configService.getModelsConfig();
-        const modelsData = Object.keys(modelsConfig).map(modelId => ({
+        let modelsData = Object.keys(modelsConfig).map(modelId => ({
             id: modelId,
             object: "model",
             created: Math.floor(Date.now() / 1000), // Placeholder timestamp
             owned_by: "google", // Assuming all configured models are Google's
             // Add other relevant properties if available/needed
         }));
+
+        // Add search versions for gemini-2.0+ series models
+        const searchModels = Object.keys(modelsConfig)
+            .filter(modelId => 
+                // Match gemini-2.0, gemini-2.5, gemini-3.0, etc. series models
+                /^gemini-[2-9]\.\d/.test(modelId) && 
+                // Exclude models that are already search versions
+                !modelId.endsWith('-search')
+            )
+            .map(modelId => ({
+                id: `${modelId}-search`,
+                object: "model",
+                created: Math.floor(Date.now() / 1000),
+                owned_by: "google",
+            }));
+        
+        // Merge regular and search model lists
+        modelsData = [...modelsData, ...searchModels];
 
         res.json({ object: "list", data: modelsData });
     } catch (error) {
@@ -73,7 +91,6 @@ router.post('/chat/completions', async (req, res, next) => {
 
             // Check in advance if it's keepalive mode, if so, no need to check the body stream
             if (!result.isKeepAlive) {
-                // Only check if geminiResponse.body is a readable stream in non-keepalive mode
                 if (!geminiResponse.body || typeof geminiResponse.body.pipe !== 'function') {
                     console.error('Gemini response body is not a readable stream for streaming request.');
                     // Send a valid SSE error event before closing
